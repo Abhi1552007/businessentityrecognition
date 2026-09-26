@@ -1,1 +1,4 @@
 dataset/
+__pycache__/
+*.pyc
+code/business_entity_resolution/work/
