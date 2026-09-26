@@ -185,3 +185,20 @@ class KeyIndex:
             J.append(c[k])
             S.append(d[k])
         return np.concatenate(I), np.concatenate(J), np.concatenate(S)
+
+
+def right_neighbors(right, pool, k=6, max_df=500, log=print):
+    """Near-duplicate neighbours among S2/S3 records (same key index, queried
+    with the S2/S3 records themselves). Returns (a, n, score) global arrays."""
+    A, Nn, S = [], [], []
+    rc = right["ctry"].astype(str).values
+    for c in sorted(set(rc)):
+        ri = np.flatnonzero(rc == c)
+        rr, rk = all_keys(right.iloc[ri], pool)
+        idx = KeyIndex(max_df).fit(rr, rk, len(ri))
+        a, n, sc = idx.query(rr, rk, len(ri), pre_k=k + 1)
+        del idx, rr, rk
+        m = a != n
+        A.append(ri[a[m]]); Nn.append(ri[n[m]]); S.append(sc[m])
+        log(f"  neighbours shard {c}: {len(ri)} records -> {m.sum()} links")
+    return np.concatenate(A).astype(np.int32), np.concatenate(Nn).astype(np.int32), np.concatenate(S)

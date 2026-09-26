@@ -246,3 +246,85 @@ def macro_f05(pred, truth, all_i):
         pr, rc = tp / len(p), tp / len(t)
         tot += 1.25 * pr * rc / (0.25 * pr + rc)
     return tot / len(all_i)
+
+
+# ---------------------------------------------------------------- sibling expansion
+ANCHOR_P = 0.5
+N_ANCHORS = 4
+
+
+def _anchors(c):
+    a = c[c["p2"] >= ANCHOR_P].sort_values(["i", "p2"], ascending=[True, False])
+    return a[a.groupby("i").cumcount() < N_ANCHORS][["i", "j", "p2"]]
+
+
+def expand(c2, nb, s1, right, model2, min_sib=85.0, chunk=150_000):
+    """add S2/S3 records that are near-duplicates of an S1 record's confident
+    candidates (second hop). New rows get a stage-2 score like the others.
+    Processed in chunks of S1 records to bound memory."""
+    from rapidfuzz import fuzz
+    anc = _anchors(c2)
+    o = np.argsort(nb[0], kind="stable")
+    na, nn = nb[0][o], nb[1][o]
+    del o
+    old = set()
+    key_old = np.sort(c2["i"].values.astype(np.int64) * 100_000_000 + c2["j"].values)
+    ai, aj = anc["i"].values, anc["j"].values
+    parts = []
+    for s in range(0, len(ai), chunk):
+        ci, cj = ai[s:s + chunk], aj[s:s + chunk]
+        lo = np.searchsorted(na, cj, "left")
+        hi = np.searchsorted(na, cj, "right")
+        cnt = hi - lo
+        rep = np.repeat(np.arange(len(cj)), cnt)
+        pos = np.concatenate([np.arange(l, h) for l, h in zip(lo, hi)]) if len(rep) else np.array([], int)
+        ei, ej, ea = ci[rep], nn[pos], cj[rep]
+        k = ei.astype(np.int64) * 100_000_000 + ej
+        p = np.minimum(np.searchsorted(key_old, k), len(key_old) - 1)
+        m = key_old[p] != k
+        ei, ej, ea = ei[m], ej[m], ea[m]
+        if len(ei) == 0:
+            continue
+        sn = F._cp(right["name_vars"].take(ej).tolist(), right["name_vars"].take(ea).tolist(), fuzz.token_set_ratio)
+        sa = F._cp(right["addr_n"].take(ej).tolist(), right["addr_n"].take(ea).tolist(), fuzz.token_set_ratio)
+        keep = np.maximum(sn, sa) >= min_sib
+        parts.append(pd.DataFrame({"i": ei[keep], "j": ej[keep]}))
+    e = pd.concat(parts, ignore_index=True).drop_duplicates(["i", "j"])
+    e = e.sort_values("i", ignore_index=True)
+    e["kscore"] = np.float32(0)
+    e = add_k_ctx(e)
+    e["k_rank"] = np.float32(PRE_K)
+    p = np.zeros(len(e), np.float32)
+    for s, t in _chunks(e, 2_000_000):
+        p[s:t] = model2.predict(stage2_matrix(s1, right, e.iloc[s:t].reset_index(drop=True)),
+                                num_threads=os.cpu_count())
+    e["p2"] = p
+    e["expanded"] = np.float32(1)
+    out = pd.concat([c2.assign(expanded=np.float32(0)), e], ignore_index=True)
+    out.sort_values(["i", "p2"], ascending=[True, False], inplace=True, ignore_index=True)
+    return out
+
+
+def sibling_features(c, s1, right):
+    """similarity of each candidate to the S1 record's other confident candidates"""
+    from rapidfuzz import fuzz
+    anc = _anchors(c)[["i", "j"]].rename(columns={"j": "anchor"})
+    d = pd.DataFrame({"row": np.arange(len(c)), "i": c["i"].values, "j": c["j"].values}).merge(anc, on="i")
+    d = d[d["j"] != d["anchor"]]
+    out = pd.DataFrame(index=np.arange(len(c)))
+    for col, nm in (("name_vars", "sib_nm"), ("addr_n", "sib_ad")):
+        v = np.zeros(len(d), np.float32)
+        for s in range(0, len(d), 1_000_000):
+            dd = d.iloc[s:s + 1_000_000]
+            v[s:s + len(dd)] = F._cp(right[col].take(dd["j"].values).tolist(),
+                                     right[col].take(dd["anchor"].values).tolist(), fuzz.token_set_ratio)
+        d[nm] = v
+    g = d.groupby("row")
+    out["sib_nm"] = g["sib_nm"].max().reindex(out.index).fillna(-1).values.astype(np.float32)
+    out["sib_ad"] = g["sib_ad"].max().reindex(out.index).fillna(-1).values.astype(np.float32)
+    out["sib_best"] = np.maximum(out["sib_nm"], out["sib_ad"])
+    out["sib_n90"] = (d.assign(h=(np.maximum(d["sib_nm"], d["sib_ad"]) >= 90)).groupby("row")["h"].sum()
+                      .reindex(out.index).fillna(0).values.astype(np.float32))
+    out["n_anchor"] = c["i"].map(anc.groupby("i").size()).fillna(0).values.astype(np.float32)
+    out["expanded"] = c["expanded"].values
+    return out
