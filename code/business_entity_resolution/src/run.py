@@ -13,22 +13,80 @@ import numpy as np
 import pandas as pd
 
 
+def id_num(ids):
+    """'S2-123' -> 2 * 10**10 + 123 (entity ids are 'S<k>-<int>')"""
+    ids = pd.Series(ids, dtype=str)
+    return ids.str[1].astype(np.int64) * 10**10 + ids.str[3:].astype(np.int64)
+
+
 def label_pairs(c, s1, right, gt_path):
     gt = pd.read_csv(gt_path, sep="\t", dtype=str, keep_default_na=False, quoting=3)
-    s1_pos = pd.Series(np.arange(len(s1)), index=s1["entity_id"].astype(str).values)
-    r_pos = pd.Series(np.arange(len(right)), index=right["entity_id"].astype(str).values)
     ex = gt.assign(m=gt["matched_entity_ids"].str.split(",")).explode("m")
     ex = ex[ex["m"] != ""]
-    ti = s1_pos.reindex(ex["source1_entity_id"].values).values
-    tj = r_pos.reindex(ex["m"].values).values
-    ok = ~(np.isnan(ti) | np.isnan(tj))
-    tkey = ti[ok].astype(np.int64) * 100_000_000 + tj[ok].astype(np.int64)
-    ckey = c["i"].values.astype(np.int64) * 100_000_000 + c["j"].values.astype(np.int64)
-    y = np.isin(ckey, tkey)
-    truth = {}
-    for i, j in zip(ti[ok].astype(np.int64), tj[ok].astype(np.int64)):
-        truth.setdefault(int(i), set()).add(int(j))
-    return y, truth
+    s1_idx = pd.Index(id_num(s1["entity_id"]).values)
+    r_idx = pd.Index(id_num(right["entity_id"]).values)
+    ti = s1_idx.get_indexer(id_num(ex["source1_entity_id"]).values)
+    tj = r_idx.get_indexer(id_num(ex["m"]).values)
+    del gt, ex, s1_idx, r_idx
+    ok = (ti >= 0) & (tj >= 0)
+    ti, tj = ti[ok].astype(np.int64), tj[ok].astype(np.int64)
+    tkey = np.sort(ti * 100_000_000 + tj)
+    y = np.zeros(len(c), bool)
+    ci, cj = c["i"].values, c["j"].values
+    for s in range(0, len(c), 10_000_000):
+        ck = ci[s:s + 10_000_000].astype(np.int64) * 100_000_000 + cj[s:s + 10_000_000]
+        pos = np.minimum(np.searchsorted(tkey, ck), len(tkey) - 1)
+        y[s:s + 10_000_000] = tkey[pos] == ck
+    return y, (ti, tj)
+
+
+def run_stage12(args, P, pool, s1, right, tr_dir, grp):
+    s1c = os.path.join(args.work, f"stage1_train_{args.limit}.parquet")
+    if os.path.exists(s1c):
+        c = pd.read_parquet(s1c, columns=["i", "j", "kscore"])
+        c = pd.DataFrame({k: c[k].to_numpy().copy() for k in c.columns})
+        gc.collect()
+    else:
+        c = P.stage1(s1, right, pool)
+        c.to_parquet(s1c)
+    y, truth = label_pairs(c, s1, right, os.path.join(tr_dir, "train_ground_truth.tsv"))
+    n_true = len(truth[0])
+    P.log(f"stage1: {len(c)} pairs, {len(c)/len(s1):.1f}/S1, recall {y.sum()/n_true:.4f}")
+
+    cg = grp[c["i"].values]
+
+    # ---- stage 2: OOF on A, full model for the rest
+    ia = np.flatnonzero(cg == 0)
+    ca = c.iloc[ia].reset_index(drop=True)
+    P.add_k_ctx(ca)
+    Xa = P.stage2_matrix(s1, right, ca)
+    ya = y[ia]
+    fold = (ca["i"].values.astype(np.int64) * 7919 % 3).astype(int)
+    oof = np.zeros(len(ca), np.float32)
+    for f in range(3):
+        m = P.fit_lgb(Xa[fold != f], ya[fold != f], args.rounds2)
+        oof[fold == f] = m.predict(Xa[fold == f])
+    m2 = P.fit_lgb(Xa, ya, args.rounds2)
+    m2.save_model(os.path.join(args.work, "stage2.txt"))
+    del Xa, ca, cg
+    gc.collect()
+    # tau2: smallest threshold that loses <= loss2 of the positives blocking found
+    pos_p = np.sort(oof[ya])
+    tau2 = float(pos_p[int(args.loss2 * len(pos_p))])
+    override = np.full(len(c), np.nan, np.float32)
+    override[ia] = oof
+    del oof, ia
+    c["y"] = y
+    del y
+    gc.collect()
+    c2 = P.stage2_prune(m2, s1, right, c, tau2, override)
+    del c, override
+    gc.collect()
+    P.log(f"stage2: tau2={tau2:.4f} -> {len(c2)} pairs, {len(c2)/len(s1):.2f}/S1, "
+          f"recall {c2['y'].sum()/n_true:.4f}")
+    c2.to_parquet(os.path.join(args.work, "stage2_train.parquet"))
+
+    return c2, tau2, truth, n_true
 
 
 def train(args, pool):
@@ -50,11 +108,8 @@ def train(args, pool):
         s1 = s1.sample(args.limit, random_state=0).reset_index(drop=True)
     P.log("train tables", len(s1), len(right))
 
-    c = P.stage1(s1, right, pool)
-    y, truth = label_pairs(c, s1, right, os.path.join(tr_dir, "train_ground_truth.tsv"))
-    n_true = sum(len(v) for v in truth.values())
-    P.log(f"stage1: {len(c)} pairs, {len(c)/len(s1):.1f}/S1, recall {y.sum()/n_true:.4f}")
-
+    s2c = os.path.join(args.work, "stage2_train.parquet")
+    s2j = os.path.join(args.work, "stage2.json")
     rng = np.random.RandomState(42)
     perm = rng.permutation(len(s1))
     A = perm[: args.n_stage2]                                   # stage-2 training
@@ -62,35 +117,15 @@ def train(args, pool):
     V = perm[args.n_stage2 + args.n_stage3: args.n_stage2 + args.n_stage3 + args.n_val]
     grp = np.full(len(s1), -1, np.int8)
     grp[A], grp[T3], grp[V] = 0, 1, 2
-    cg = grp[c["i"].values]
-
-    # ---- stage 2: OOF on A, full model for the rest
-    ia = np.flatnonzero(cg == 0)
-    ca = c.iloc[ia].reset_index(drop=True)
-    Xa = P.stage2_matrix(s1, right, ca)
-    ya = y[ia]
-    fold = (ca["i"].values * 2654435761 % 3).astype(int)
-    p2 = np.zeros(len(c), np.float32)
-    oof = np.zeros(len(ca), np.float32)
-    for f in range(3):
-        m = P.fit_lgb(Xa[fold != f], ya[fold != f], args.rounds2)
-        oof[fold == f] = m.predict(Xa[fold == f])
-    m2 = P.fit_lgb(Xa, ya, args.rounds2)
-    m2.save_model(os.path.join(args.work, "stage2.txt"))
-    del Xa
-    gc.collect()
-    rest = np.flatnonzero(cg != 0)
-    p2[rest] = P.stage2_predict(m2, s1, right, c.iloc[rest].reset_index(drop=True))
-    p2[ia] = oof
-
-    # tau2: smallest threshold that loses <= loss2 of the positives blocking found
-    pos_p = np.sort(oof[ya])
-    tau2 = float(pos_p[int(args.loss2 * len(pos_p))])
-    c2 = P.prune(c.assign(y=y), p2, tau2)
-    P.log(f"stage2: tau2={tau2:.4f} -> {len(c2)} pairs, {len(c2)/len(s1):.2f}/S1, "
-          f"recall {c2['y'].sum()/n_true:.4f}")
-    del c, y, p2
-    gc.collect()
+    if os.path.exists(s2c) and os.path.exists(s2j):
+        c2 = pd.read_parquet(s2c)
+        tau2 = json.load(open(s2j))["tau2"]
+        _, truth = label_pairs(c2, s1, right, os.path.join(tr_dir, "train_ground_truth.tsv"))
+        n_true = len(truth[0])
+        P.log(f"resumed stage2 output: {len(c2)} pairs")
+    else:
+        c2, tau2, truth, n_true = run_stage12(args, P, pool, s1, right, tr_dir, grp)
+        json.dump({"tau2": tau2}, open(s2j, "w"))
 
     # ---- stage 3 on all surviving pairs (context needs every S1 present)
     ctx = P.context(c2)
@@ -116,14 +151,18 @@ def train(args, pool):
 
     # ---- decision tuning on V (never used for fitting)
     all_v = V.tolist()
-    truth_v = {i: truth[i] for i in all_v if i in truth}
+    truth_v = {}
+    vset = set(all_v)
+    for i, j in zip(truth[0].tolist(), truth[1].tolist()):
+        if i in vset:
+            truth_v.setdefault(i, set()).add(j)
     pe = P.exclusive(c2, p3)
     vm = np.isin(c2["i"].values, V)
     cv = c2[vm].reset_index(drop=True)
     res = {}
     for mode in ("thr", "exp"):
-        for tau in np.arange(0.2, 0.8, 0.025):
-            for exc in (0, 1):
+        for tau in np.arange(0.3, 0.71, 0.05):
+            for exc in (1,):
                 pp = (pe if exc else p3)[vm]
                 pred = P.select(cv, pp, tau, mode)
                 res[(mode, round(float(tau), 3), exc)] = P.macro_f05(pred, truth_v, all_v)
@@ -149,12 +188,13 @@ def predict3(P, m3, s1, right, c2, ctx, chunk=3_000_000):
     return p3
 
 
-def write_ids(path, col, s1, groups):
-    ids = s1["entity_id"].astype(str).values
-    with open(path, "w") as f:
-        f.write(f"source1_entity_id\t{col}\n")
-        for i in range(len(s1)):
-            f.write(ids[i] + "\t" + ",".join(groups.get(i, ())) + "\n")
+def write_ids(path, col, s1, I, ids):
+    """one row per S1 record; I (S1 positions) and ids (S2/S3 ids) aligned, pre-ordered"""
+    lists = pd.Series(ids, dtype=object).groupby(np.asarray(I)).agg(",".join)
+    out = pd.Series("", index=np.arange(len(s1)), dtype=object)
+    out.loc[lists.index] = lists.values
+    df = pd.DataFrame({"source1_entity_id": s1["entity_id"].to_numpy(dtype=object), col: out.values})
+    df.to_csv(path, sep="\t", index=False, quoting=3)
 
 
 def predict(args, pool):
@@ -165,27 +205,31 @@ def predict(args, pool):
     cache.load_split(args.data, "test", os.path.join(args.work, "cache"), tl, pool=pool, keep=False)
     s1, right = P.load_tables(os.path.join(args.work, "cache"), "test")
     P.log("test tables", len(s1), len(right))
-    c = P.stage1(s1, right, pool)
-    P.log(f"stage1: {len(c)} pairs")
-    m2 = lgb.Booster(model_file=os.path.join(args.work, "stage2.txt"))
-    p2 = P.stage2_predict(m2, s1, right, c)
-    c2 = P.prune(c, p2, cfg["tau2"])
-    del c, p2
-    gc.collect()
+    s2c = os.path.join(args.work, "stage2_test.parquet")
+    if os.path.exists(s2c):
+        c2 = pd.read_parquet(s2c)
+    else:
+        c = P.stage1(s1, right, pool)
+        P.log(f"stage1: {len(c)} pairs")
+        m2 = lgb.Booster(model_file=os.path.join(args.work, "stage2.txt"))
+        c2 = P.stage2_prune(m2, s1, right, c, cfg["tau2"])
+        del c
+        gc.collect()
+        c2.to_parquet(s2c)
     P.log(f"stage2: {len(c2)} candidate pairs, {len(c2)/len(s1):.2f}/S1")
-    rid = right["entity_id"].astype(str).values
+    rid = right["entity_id"].to_numpy(dtype=object)
     os.makedirs(args.out, exist_ok=True)
-    cand = {i: rid[g].tolist() for i, g in c2.groupby("i")["j"]}
-    write_ids(os.path.join(args.out, "candidate_pairs.tsv"), "candidate_entity_ids", s1, cand)
+    write_ids(os.path.join(args.out, "candidate_pairs.tsv"), "candidate_entity_ids", s1,
+              c2["i"].values, rid[c2["j"].values])
     ctx = P.context(c2)
     m3 = lgb.Booster(model_file=os.path.join(args.work, "stage3.txt"))
     p3 = predict3(P, m3, s1, right, c2, ctx)
     pp = P.exclusive(c2, p3) if cfg["exclusive"] else p3
     pred = P.select(c2, pp, cfg["tau"], cfg["mode"])
-    match = {i: rid[js].tolist() for i, js in pred.items()}
-    write_ids(os.path.join(args.out, "matching_results.tsv"), "matched_entity_ids", s1, match)
-    P.log(f"wrote outputs: {sum(len(v) for v in match.values())} matches, "
-          f"{sum(1 for v in match.values() if v)} / {len(s1)} S1 with >=1 match")
+    mi = np.array([i for i, js in pred.items() for _ in js], dtype=np.int64)
+    mj = np.array([j for js in pred.values() for j in js], dtype=np.int64)
+    write_ids(os.path.join(args.out, "matching_results.tsv"), "matched_entity_ids", s1, mi, rid[mj])
+    P.log(f"wrote outputs: {len(mi)} matches, {len(pred)} / {len(s1)} S1 with >=1 match")
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ def _take(df, col, idx):
     return df[col].take(idx).tolist()
 
 
-def cheap_features(L, R, I, J):
+def _cheap(L, R, I, J):
     """Small, fast feature set used by the stage-2 candidate pruner."""
     f = {}
     vl, vr = _take(L, "name_vars", I), _take(R, "name_vars", J)
@@ -75,7 +75,7 @@ def cheap_features(L, R, I, J):
     return pd.DataFrame(f)
 
 
-def pair_features(L, R, I, J):
+def _full(L, R, I, J):
     """L, R: prepared record tables; I, J: aligned index arrays of pairs."""
     f = {}
     vl, vr = _take(L, "name_vars", I), _take(R, "name_vars", J)
@@ -148,3 +148,16 @@ def context_features(df, score_col, prefix):
     df[prefix + "rgap"] = (h.transform("max") - df[score_col]).astype(np.float32)
     df[prefix + "rn"] = h.transform("size").astype(np.float32)
     return df
+
+
+def _chunked(fn, L, R, I, J, n=750_000):
+    parts = [fn(L, R, I[s:s + n], J[s:s + n]) for s in range(0, len(I), n)]
+    return pd.concat(parts, ignore_index=True) if len(parts) != 1 else parts[0]
+
+
+def cheap_features(L, R, I, J):
+    return _chunked(_cheap, L, R, I, J)
+
+
+def pair_features(L, R, I, J):
+    return _chunked(_full, L, R, I, J)
