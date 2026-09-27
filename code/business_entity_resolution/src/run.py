@@ -89,6 +89,32 @@ def run_stage12(args, P, pool, s1, right, tr_dir, grp):
     return c2, tau2, truth, n_true
 
 
+def add_siblings(args, P, pool, s1, right, c2, split):
+    """second hop: near-duplicate S2/S3 neighbours of confident candidates"""
+    import lightgbm as lgb
+    nbp = os.path.join(args.work, f"neighbours_{split}_k{args.nb_k}.npz")
+    if os.path.exists(nbp):
+        z = np.load(nbp)
+        nb = (z["a"], z["n"])
+    else:
+        a, n, _ = P.B.right_neighbors(right, pool, k=args.nb_k, log=P.log)
+        np.savez(nbp, a=a, n=n)
+        nb = (a, n)
+    m2 = lgb.Booster(model_file=os.path.join(args.work, "stage2.txt"))
+    before = len(c2)
+    c2 = P.expand(c2.drop(columns=[x for x in ("expanded",) if x in c2.columns]), nb, s1, right, m2)
+    P.log(f"sibling expansion: {before} -> {len(c2)} pairs ({len(c2)/len(s1):.2f}/S1)")
+    return c2
+
+
+def full_context(P, s1, right, c2):
+    ctx = P.context(c2)
+    sib = P.sibling_features(c2, s1, right)
+    for k in sib.columns:
+        ctx[k] = sib[k].values
+    return ctx
+
+
 def train(args, pool):
     from ber import cache, pipeline as P, translit as T, prep
     import lightgbm as lgb
@@ -127,8 +153,11 @@ def train(args, pool):
         c2, tau2, truth, n_true = run_stage12(args, P, pool, s1, right, tr_dir, grp)
         json.dump({"tau2": tau2}, open(s2j, "w"))
 
-    # ---- stage 3 on all surviving pairs (context needs every S1 present)
-    ctx = P.context(c2)
+    # ---- sibling expansion + stage 3 on all surviving pairs (context needs every S1 present)
+    c2 = add_siblings(args, P, pool, s1, right, c2, "train")
+    c2["y"], _ = label_pairs(c2, s1, right, os.path.join(tr_dir, "train_ground_truth.tsv"))
+    P.log(f"after expansion recall {c2['y'].sum()/n_true:.4f}")
+    ctx = full_context(P, s1, right, c2)
     p3 = np.zeros(len(c2), np.float32)
     cg2 = grp[c2["i"].values]
     it = np.flatnonzero(cg2 == 1)
@@ -216,12 +245,13 @@ def predict(args, pool):
         del c
         gc.collect()
         c2.to_parquet(s2c)
-    P.log(f"stage2: {len(c2)} candidate pairs, {len(c2)/len(s1):.2f}/S1")
+    c2 = add_siblings(args, P, pool, s1, right, c2, "test")
+    P.log(f"stage2+expansion: {len(c2)} candidate pairs, {len(c2)/len(s1):.2f}/S1")
     rid = right["entity_id"].to_numpy(dtype=object)
     os.makedirs(args.out, exist_ok=True)
     write_ids(os.path.join(args.out, "candidate_pairs.tsv"), "candidate_entity_ids", s1,
               c2["i"].values, rid[c2["j"].values])
-    ctx = P.context(c2)
+    ctx = full_context(P, s1, right, c2)
     m3 = lgb.Booster(model_file=os.path.join(args.work, "stage3.txt"))
     p3 = predict3(P, m3, s1, right, c2, ctx)
     pp = P.exclusive(c2, p3) if cfg["exclusive"] else p3
@@ -243,6 +273,7 @@ if __name__ == "__main__":
     ap.add_argument("--n_val", type=int, default=150_000)
     ap.add_argument("--rounds2", type=int, default=300)
     ap.add_argument("--rounds3", type=int, default=2000)
+    ap.add_argument("--nb_k", type=int, default=25)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--loss2", type=float, default=0.003)
     args = ap.parse_args()
