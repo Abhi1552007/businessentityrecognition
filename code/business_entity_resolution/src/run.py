@@ -43,7 +43,7 @@ def label_pairs(c, s1, right, gt_path):
 def run_stage12(args, P, pool, s1, right, tr_dir, grp):
     s1c = os.path.join(args.work, f"stage1_train_{args.limit}.parquet")
     if os.path.exists(s1c):
-        c = pd.read_parquet(s1c, columns=["i", "j", "kscore"])
+        c = pd.read_parquet(s1c, columns=["i", "j", "kscore", "s_rare", "s_addr"])
         c = pd.DataFrame({k: c[k].to_numpy().copy() for k in c.columns})
         gc.collect()
     else:

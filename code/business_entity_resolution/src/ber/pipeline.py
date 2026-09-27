@@ -22,7 +22,7 @@ import pandas as pd
 from . import blocking as B
 from . import features as F
 
-PRE_K = 40
+PRE_K = 50
 MAX_DF = 500
 K2 = 12
 
@@ -48,16 +48,12 @@ def load_tables(cache_dir, split):
 # ---------------------------------------------------------------- stage 1
 def stage1(s1, right, pool):
     """-> DataFrame(i, j, kscore) sorted by i then descending kscore."""
-    I, J, S = B.block(s1, right, pool, max_df=MAX_DF, pre_k=PRE_K, log=log)
-    # each shard returns rows grouped by i with descending score; a stable
-    # sort on i keeps that order globally
-    o = np.argsort(I, kind="stable")
-    c = pd.DataFrame({"i": I[o].astype(np.int32), "j": J[o].astype(np.int32),
-                      "kscore": S[o].astype(np.float32)})
+    c = B.block_multi(s1, right, pool, log=log).rename(columns={"s_main": "kscore"})
+    c.sort_values(["i", "kscore"], ascending=[True, False], inplace=True, ignore_index=True)
     return c
 
 
-STAGE1_COLS = ["kscore", "k_rank", "k_gap", "k_rel", "k_n"]
+STAGE1_COLS = ["kscore", "k_rank", "k_gap", "k_rel", "k_n", "s_rare", "s_addr"]
 
 
 def add_k_ctx(c):
@@ -292,6 +288,8 @@ def expand(c2, nb, s1, right, model2, min_sib=85.0, chunk=150_000):
     e = pd.concat(parts, ignore_index=True).drop_duplicates(["i", "j"])
     e = e.sort_values("i", ignore_index=True)
     e["kscore"] = np.float32(0)
+    e["s_rare"] = np.float32(0)
+    e["s_addr"] = np.float32(0)
     e = add_k_ctx(e)
     e["k_rank"] = np.float32(PRE_K)
     p = np.zeros(len(e), np.float32)

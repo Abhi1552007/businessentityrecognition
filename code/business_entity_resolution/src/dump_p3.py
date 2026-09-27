@@ -17,7 +17,7 @@ m2 = lgb.Booster(model_file=W + "/stage2.txt")
 c2 = P.expand(c2, (z["a"], z["n"]), s1, right, m2)
 del z
 ctx = run.full_context(P, s1, right, c2)
-m3 = lgb.Booster(model_file=W + "/stage3_v2.txt")
+m3 = lgb.Booster(model_file=W + "/stage3.txt")
 c2["p3"] = run.predict3(P, m3, s1, right, c2, ctx)
 out = c2[["i", "j", "p2", "p3", "expanded"]].copy()
 if gt != "none":
