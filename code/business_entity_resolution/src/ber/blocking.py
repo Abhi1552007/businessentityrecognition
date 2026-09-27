@@ -181,24 +181,35 @@ class KeyIndex:
             start = np.searchsorted(r, r, side="left")
             rank = np.arange(len(r)) - start
             k = rank < pre_k
-            I.append(r[k] + s)
-            J.append(c[k])
-            S.append(d[k])
+            I.append((r[k] + s).astype(np.int32))
+            J.append(c[k].astype(np.int32))
+            S.append(d[k].astype(np.float32))
+            del P, rows, order, r, c, d, start, rank, k
         return np.concatenate(I), np.concatenate(J), np.concatenate(S)
 
 
 def right_neighbors(right, pool, k=6, max_df=500, log=print):
     """Near-duplicate neighbours among S2/S3 records (same key index, queried
     with the S2/S3 records themselves). Returns (a, n, score) global arrays."""
-    A, Nn, S = [], [], []
+    A, Nn = [], []
     rc = right["ctry"].astype(str).values
     for c in sorted(set(rc)):
         ri = np.flatnonzero(rc == c)
         rr, rk = all_keys(right.iloc[ri], pool)
         idx = KeyIndex(max_df).fit(rr, rk, len(ri))
-        a, n, sc = idx.query(rr, rk, len(ri), pre_k=k + 1)
+        a_l, n_l = [], []
+        step = 1_000_000
+        for lo in range(0, len(ri), step):
+            hi = min(len(ri), lo + step)
+            s0, s1_ = np.searchsorted(rr, lo, "left"), np.searchsorted(rr, hi, "left")
+            a_, n_, _ = idx.query(rr[s0:s1_] - lo, rk[s0:s1_], hi - lo, pre_k=k + 1, chunk=10000)
+            a_l.append(a_ + lo); n_l.append(n_)
         del idx, rr, rk
+        a, n = np.concatenate(a_l), np.concatenate(n_l)
+        del a_l, n_l
         m = a != n
-        A.append(ri[a[m]]); Nn.append(ri[n[m]]); S.append(sc[m])
-        log(f"  neighbours shard {c}: {len(ri)} records -> {m.sum()} links")
-    return np.concatenate(A).astype(np.int32), np.concatenate(Nn).astype(np.int32), np.concatenate(S)
+        ri32 = ri.astype(np.int32)
+        A.append(ri32[a[m]]); Nn.append(ri32[n[m]])
+        del a, n, m
+        log(f"  neighbours shard {c}: {len(ri)} records -> {len(A[-1])} links")
+    return np.concatenate(A), np.concatenate(Nn), None

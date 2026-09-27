@@ -92,7 +92,7 @@ def run_stage12(args, P, pool, s1, right, tr_dir, grp):
 def add_siblings(args, P, pool, s1, right, c2, split):
     """second hop: near-duplicate S2/S3 neighbours of confident candidates"""
     import lightgbm as lgb
-    nbp = os.path.join(args.work, f"neighbours_{split}.npz")
+    nbp = os.path.join(args.work, f"neighbours_{split}_k{args.nb_k}.npz")
     if os.path.exists(nbp):
         z = np.load(nbp)
         nb = (z["a"], z["n"])
@@ -273,7 +273,7 @@ if __name__ == "__main__":
     ap.add_argument("--n_val", type=int, default=150_000)
     ap.add_argument("--rounds2", type=int, default=300)
     ap.add_argument("--rounds3", type=int, default=2000)
-    ap.add_argument("--nb_k", type=int, default=6)
+    ap.add_argument("--nb_k", type=int, default=25)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--loss2", type=float, default=0.003)
     args = ap.parse_args()
