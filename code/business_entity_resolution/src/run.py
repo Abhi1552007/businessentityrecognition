@@ -235,10 +235,11 @@ def predict(args, pool):
     s1, right = P.load_tables(os.path.join(args.work, "cache"), "test")
     P.log("test tables", len(s1), len(right))
     s2c = os.path.join(args.work, "stage2_test.parquet")
+    s1t = os.path.join(args.work, "stage1_test.parquet")
     if os.path.exists(s2c):
         c2 = pd.read_parquet(s2c)
     else:
-        c = P.stage1(s1, right, pool)
+        c = pd.read_parquet(s1t) if os.path.exists(s1t) else P.stage1(s1, right, pool)
         P.log(f"stage1: {len(c)} pairs")
         m2 = lgb.Booster(model_file=os.path.join(args.work, "stage2.txt"))
         c2 = P.stage2_prune(m2, s1, right, c, cfg["tau2"])
