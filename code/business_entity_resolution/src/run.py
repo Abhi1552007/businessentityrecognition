@@ -43,7 +43,7 @@ def label_pairs(c, s1, right, gt_path):
 def run_stage12(args, P, pool, s1, right, tr_dir, grp):
     s1c = os.path.join(args.work, f"stage1_train_{args.limit}.parquet")
     if os.path.exists(s1c):
-        c = pd.read_parquet(s1c, columns=["i", "j", "kscore"])
+        c = pd.read_parquet(s1c, columns=["i", "j", "kscore", "s_rare", "s_addr"])
         c = pd.DataFrame({k: c[k].to_numpy().copy() for k in c.columns})
         gc.collect()
     else:
@@ -235,10 +235,11 @@ def predict(args, pool):
     s1, right = P.load_tables(os.path.join(args.work, "cache"), "test")
     P.log("test tables", len(s1), len(right))
     s2c = os.path.join(args.work, "stage2_test.parquet")
+    s1t = os.path.join(args.work, "stage1_test.parquet")
     if os.path.exists(s2c):
         c2 = pd.read_parquet(s2c)
     else:
-        c = P.stage1(s1, right, pool)
+        c = pd.read_parquet(s1t) if os.path.exists(s1t) else P.stage1(s1, right, pool)
         P.log(f"stage1: {len(c)} pairs")
         m2 = lgb.Booster(model_file=os.path.join(args.work, "stage2.txt"))
         c2 = P.stage2_prune(m2, s1, right, c, cfg["tau2"])
@@ -254,6 +255,7 @@ def predict(args, pool):
     ctx = full_context(P, s1, right, c2)
     m3 = lgb.Booster(model_file=os.path.join(args.work, "stage3.txt"))
     p3 = predict3(P, m3, s1, right, c2, ctx)
+    c2.assign(p3=p3)[["i", "j", "p2", "p3", "expanded"]].to_parquet(os.path.join(args.work, "p3_test.parquet"))
     pp = P.exclusive(c2, p3) if cfg["exclusive"] else p3
     pred = P.select(c2, pp, cfg["tau"], cfg["mode"])
     mi = np.array([i for i, js in pred.items() for _ in js], dtype=np.int64)

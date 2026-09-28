@@ -17,11 +17,13 @@ No all-pairs comparison is ever made.
 The learned pruning step that shrinks these ``pre_k`` to the final small
 candidate list lives in pipeline.py (stage-2 ranker).
 """
+import gc
 import hashlib
 import os
 from multiprocessing import Pool
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 
 from . import normalize as N
@@ -36,7 +38,7 @@ _HOUSE_SKIP = {"unit", "number", "house", "floor", "suite", "apartment", "flat",
                "box", "pmb", "n", "s", "e", "w", "ne", "nw", "se", "sw", "a", "b", "c", "d"}
 
 
-def record_keys(name_vars, addr_n, ctry):
+def record_keys(name_vars, addr_n, ctry, fams=None, raw=False):
     keys = set()
     at = addr_n.split()
     nums = [t.lstrip("0") for t in at if t.isdigit()][:3]
@@ -94,6 +96,10 @@ def record_keys(name_vars, addr_n, ctry):
     alpha = [t for t in at if not t.isdigit() and t not in _ALPHA_STOP and len(t) >= 3]
     for a, b in zip(alpha, alpha[1:]):
         keys.add("s" + N.skeleton(a) + "_" + N.skeleton(b))
+    if fams:
+        keys = [k for k in keys if k[0] in fams]
+    if raw:
+        return [ctry + ":" + k for k in keys]
     return [_h(ctry + ":" + k) for k in keys]
 
 
@@ -103,24 +109,24 @@ def _h(s):
 
 
 def _keys_chunk(args):
-    base, rows = args
+    base, rows, fams = args if len(args) == 3 else (*args, None)
     rec, ks = [], []
     for i, (nv, ad, c) in enumerate(rows):
-        k = record_keys(nv, ad, c)
+        k = record_keys(nv, ad, c, fams)
         ks.extend(k)
         rec.extend([base + i] * len(k))
     return np.asarray(rec, np.int32), np.asarray(ks, np.int64)
 
 
-def all_keys(df, pool, chunk=50000):
+def all_keys(df, pool, chunk=50000, fams=None):
     nv, ad, ct = df["name_vars"].values, df["addr_n"].values, df["ctry"].astype(str).values
-    jobs = ((i, list(zip(nv[i:i + chunk], ad[i:i + chunk], ct[i:i + chunk])))
+    jobs = ((i, list(zip(nv[i:i + chunk], ad[i:i + chunk], ct[i:i + chunk])), fams)
             for i in range(0, len(df), chunk))
     parts = list(pool.imap(_keys_chunk, jobs))
     return np.concatenate([a for a, _ in parts]), np.concatenate([b for _, b in parts])
 
 
-def block(s1, right, pool, max_df=500, pre_k=40, log=print):
+def block(s1, right, pool, max_df=500, pre_k=40, log=print, fams=None):
     """Country-sharded blocking. Returns global (i, j, key_score) arrays."""
     I, J, S = [], [], []
     lc, rc = s1["ctry"].astype(str).values, right["ctry"].astype(str).values
@@ -129,10 +135,10 @@ def block(s1, right, pool, max_df=500, pre_k=40, log=print):
         ri = np.flatnonzero(rc == c)
         if len(li) == 0 or len(ri) == 0:
             continue
-        rr, rk = all_keys(right.iloc[ri], pool)
+        rr, rk = all_keys(right.iloc[ri], pool, fams=fams)
         idx = KeyIndex(max_df).fit(rr, rk, len(ri))
         del rr, rk
-        lr, lk = all_keys(s1.iloc[li], pool)
+        lr, lk = all_keys(s1.iloc[li], pool, fams=fams)
         i, j, sc = idx.query(lr, lk, len(li), pre_k=pre_k)
         del idx
         I.append(li[i]); J.append(ri[j]); S.append(sc)
@@ -141,8 +147,9 @@ def block(s1, right, pool, max_df=500, pre_k=40, log=print):
 
 
 class KeyIndex:
-    def __init__(self, max_df=400):
+    def __init__(self, max_df=400, power=1.0):
         self.max_df = max_df
+        self.power = power
 
     def fit(self, right_rec, right_key, n_right):
         order = np.argsort(right_key, kind="stable")
@@ -160,7 +167,7 @@ class KeyIndex:
         remap = np.cumsum(keep) - 1
         self.RT = sp.csr_matrix((np.ones(int(m.sum()), np.float32), (remap[col[m]], right_rec[m])),
                                 shape=(len(self.keys), n_right))
-        self.idf = np.log1p(n_right / df[keep]).astype(np.float32)
+        self.idf = (np.log1p(n_right / df[keep]) ** self.power).astype(np.float32)
         self.n_right = n_right
         return self
 
@@ -213,3 +220,52 @@ def right_neighbors(right, pool, k=6, max_df=500, log=print):
         del a, n, m
         log(f"  neighbours shard {c}: {len(ri)} records -> {len(A[-1])} links")
     return np.concatenate(A), np.concatenate(Nn), None
+
+
+# (name, key families or None=all, max_df, idf power, top-k)
+CHANNELS = [
+    ("main", None, 500, 3.0, 50),     # all keys, rare keys dominate (idf^3)
+    ("rare", None, 20, 1.0, 10),      # anything sharing a near-unique key
+    ("addr", "zns", 500, 3.0, 5),     # address-only keys (fake/DBA names)
+]
+
+
+def block_multi(s1, right, pool, channels=CHANNELS, log=print):
+    """Country-sharded multi-channel blocking. Returns a DataFrame with one row
+    per (i, j) and the score from each channel (0 when the pair was not in that
+    channel's top-k)."""
+    out = []
+    lc, rc = s1["ctry"].astype(str).values, right["ctry"].astype(str).values
+    for c in sorted(set(lc)):
+        li = np.flatnonzero(lc == c)
+        ri = np.flatnonzero(rc == c)
+        if len(li) == 0 or len(ri) == 0:
+            continue
+        parts = []
+        keys_cache = {}
+        for name, fams, max_df, power, k in channels:
+            if fams not in keys_cache:
+                keys_cache.clear()
+                gc.collect()
+                keys_cache[fams] = (all_keys(right.iloc[ri], pool, fams=fams),
+                                    all_keys(s1.iloc[li], pool, fams=fams))
+            (rr, rk), (lr, lk) = keys_cache[fams]
+            idx = KeyIndex(max_df, power).fit(rr, rk, len(ri))
+            i, j, sc = idx.query(lr, lk, len(li), pre_k=k)
+            del idx
+            parts.append((name, li[i].astype(np.int32), ri[j].astype(np.int32), sc))
+        keys_cache.clear()
+        gc.collect()
+        key = np.concatenate([p[1].astype(np.int64) << 32 | p[2].astype(np.int64) for p in parts])
+        uk, inv = np.unique(key, return_inverse=True)
+        df = {"i": (uk >> 32).astype(np.int32), "j": (uk & 0xFFFFFFFF).astype(np.int32)}
+        off = 0
+        for name, a, b, sc in parts:
+            col = np.zeros(len(uk), np.float32)
+            col[inv[off:off + len(a)]] = sc
+            df["s_" + name] = col
+            off += len(a)
+        out.append(pd.DataFrame(df))
+        del parts, key, uk, inv
+        log(f"  blocking shard {c}: {len(li)} x {len(ri)} -> {len(out[-1])} pairs")
+    return pd.concat(out, ignore_index=True)
