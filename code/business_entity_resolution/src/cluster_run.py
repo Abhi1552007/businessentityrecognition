@@ -41,7 +41,7 @@ else:
 
 prr = C.predict_rr(m, right, a, b)
 cfg = json.load(open(f"{W}/stage4.json")) if mode != "train" else {}
-taus = [cfg["tau_rr"]] if mode != "train" else [0.8, 0.9, 0.97]
+taus = [cfg["tau_rr"]] if mode != "train" else [0.9]
 
 if mode == "train":
     oa, ob = owner[a], owner[b]

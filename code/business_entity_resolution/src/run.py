@@ -255,6 +255,7 @@ def predict(args, pool):
     ctx = full_context(P, s1, right, c2)
     m3 = lgb.Booster(model_file=os.path.join(args.work, "stage3.txt"))
     p3 = predict3(P, m3, s1, right, c2, ctx)
+    c2.assign(p3=p3)[["i", "j", "p2", "p3", "expanded"]].to_parquet(os.path.join(args.work, "p3_test.parquet"))
     pp = P.exclusive(c2, p3) if cfg["exclusive"] else p3
     pred = P.select(c2, pp, cfg["tau"], cfg["mode"])
     mi = np.array([i for i, js in pred.items() for _ in js], dtype=np.int64)
