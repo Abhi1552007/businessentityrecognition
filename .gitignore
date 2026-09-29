@@ -6,3 +6,4 @@ output/
 *.zip
 *.xz
 parts/
+.DS_Store

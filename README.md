@@ -1,3 +1,20 @@
+# Business Entity Resolution
+
+My solution to the **ML Challenge 2026 Business Entity Resolution** problem: deciding which business records across three noisy, independent sources refer to the same real-world company, with no shared identifiers. The data covers the US and India in training, plus a **country never seen in training (France)** at test time.
+
+**Pipeline:** blocking → learned candidate pruning → LightGBM matcher → exclusive, F0.5-aware assignment. No external APIs or pretrained language models; everything is learned from the training data.
+
+Highlights:
+- **Normalisation** that handles legal suffixes, abbreviations, DBA/AKA names, leetspeak repair (`pub1ic` → `public`), accent folding and phonetic keys
+- **Learned transliteration** from native scripts (Devanagari, Tamil, Telugu …) to Latin, mined from training matches
+- **Country-sharded inverted-index blocking** with IDF-weighted scoring, keeping candidate sets small
+- **Two-stage LightGBM**: candidate pruning, then pair matching on fuzzy-string features (rapidfuzz)
+- **Expected-F0.5 set selection**, tuned to the precision-weighted competition metric
+
+➡️ Code, setup and how to reproduce: [`code/business_entity_resolution/`](code/business_entity_resolution/README.md)
+
+---
+
 # ML Challenge 2026 Problem Statement
 
 ## Business Entity Resolution Challenge
